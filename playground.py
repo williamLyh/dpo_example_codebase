@@ -25,7 +25,6 @@ CACHE_DIR = None
 # 加载模型和 tokenizer
 # -----------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR, padding_side="right", truncation=True, max_length=MAX_PROMPT_LEN)
-tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR).to(DEVICE)
 
 # reference policy，冻结参数
