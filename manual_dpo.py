@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, RandomSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
 import torch.nn.functional as F
@@ -10,22 +10,24 @@ CACHE_DIR = "/home/yl535/rds/hpc-work/cache"
 # 配置
 # -----------------------
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
-BATCH_SIZE = 20
-LR = 5e-5
+BATCH_SIZE = 6
+LR = 5e-6
 EPOCHS = 1
-BETA = 0.1
+BETA = 0.05
 MAX_PROMPT_LEN = 512
 MAX_RESP_LEN = 512
+PRINT_EVERY_N_STEPS = 100
+VALIDATE_EVERY_N_STEPS = 1000
 PAD_TO_MULTIPLE_OF = 8  # 便于 tensor core 加速
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# CACHE_DIR = "/home/yl535/rds/hpc-work/cache"
-CACHE_DIR = None
+CACHE_DIR = "/home/yl535/rds/hpc-work/cache"
+# CACHE_DIR = None
 
 # -----------------------
 # 加载模型和 tokenizer
 # -----------------------
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR, padding_side="right", truncation=True, max_length=MAX_PROMPT_LEN)
-tokenizer.pad_token = tokenizer.eos_token
+# tokenizer.pad_token = tokenizer.eos_token
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, cache_dir=CACHE_DIR).to(DEVICE)
 
 # reference policy，冻结参数
@@ -36,19 +38,8 @@ ref_model.eval()  # 不训练
 # 加载偏好数据集
 # 数据集格式: { "prompt": ..., "chosen": ..., "rejected": ... }
 # -----------------------
-dataset = load_dataset("Dahoas/rm-static", cache_dir=CACHE_DIR)["train"]
-
-# def tokenize_pair(example):
-#     prompt_ids = tokenizer(example["prompt"], return_tensors="pt").input_ids
-#     chosen_ids = tokenizer(example["chosen"], return_tensors="pt").input_ids
-#     rejected_ids = tokenizer(example["rejected"], return_tensors="pt").input_ids
-#     return {
-#         "prompt_ids": prompt_ids,
-#         "chosen_ids": chosen_ids,
-#         "rejected_ids": rejected_ids
-#     }
-
-# dataset = dataset.map(tokenize_pair)
+train_dataset = load_dataset("Dahoas/rm-static", cache_dir=CACHE_DIR)["train"]
+test_dataset = load_dataset("Dahoas/rm-static", cache_dir=CACHE_DIR)["test"]
 
 # -----------------------
 # DataLoader
@@ -84,8 +75,9 @@ def collate_fn(batch):
         'prompt_offset_lens': torch.tensor(prompt_offset_lens, dtype=torch.int32)}
 
 
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+sampler = RandomSampler(test_dataset, num_samples=500, replacement=False)  
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn, sampler=sampler)
 
 
 def get_sequence_logprobs(ids, logits, attention_mask, prompt_offset_lens):
@@ -107,8 +99,8 @@ def get_sequence_logprobs(ids, logits, attention_mask, prompt_offset_lens):
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
 
-
-for batch in tqdm(loader):
+loss_log = []
+for step, batch in enumerate(tqdm(train_loader)):
     optimizer.zero_grad()
 
     prompt_chosen_batch = batch['prompt_chosen_ids'].to(DEVICE)
@@ -117,26 +109,58 @@ for batch in tqdm(loader):
     prompt_rejected_batch_attention_mask = batch['prompt_rejected_attention_mask'].to(DEVICE)
     prompt_offset_lens_batch = batch['prompt_offset_lens'].to(DEVICE)
     
-    # print(tokenizer.decode(prompt_chosen_batch[1]))
-    # print(tokenizer.decode(prompt_chosen_batch[1][prompt_offset_lens_batch[1]:]))
-
     # 计算损失
     outputs_chosen = model(prompt_chosen_batch)
-    output_rejceted = model(prompt_rejected_batch)
+    outputs_rejceted = model(prompt_rejected_batch)
 
     chosen_seq_logprob = get_sequence_logprobs(prompt_chosen_batch, outputs_chosen.logits, prompt_chosen_batch_attention_mask, prompt_offset_lens_batch)
-    rejected_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, output_rejceted.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
+    rejected_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, outputs_rejceted.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
 
     with torch.no_grad():
         outputs_chosen_ref = ref_model(prompt_chosen_batch)
-        output_rejceted_ref = ref_model(prompt_rejected_batch)
+        outputs_rejceted_ref = ref_model(prompt_rejected_batch)
         chosen_ref_seq_logprob = get_sequence_logprobs(prompt_chosen_batch, outputs_chosen_ref.logits, prompt_chosen_batch_attention_mask, prompt_offset_lens_batch)
-        rejected_ref_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, output_rejceted_ref.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
+        rejected_ref_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, outputs_rejceted_ref.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
 
     log_ratio_chosen = chosen_seq_logprob - chosen_ref_seq_logprob
     log_ratio_rejected = rejected_seq_logprob - rejected_ref_seq_logprob
-    loss = -torch.log(torch.sigmoid((log_ratio_chosen - log_ratio_rejected)/BETA)).mean()
+    loss = -torch.F.logsigmoid((log_ratio_chosen - log_ratio_rejected)*BETA).mean()
 
-    print(loss.item())
     loss.backward()
     optimizer.step()
+
+    loss_log.append(loss.item())
+    # 记录损失
+    if step % PRINT_EVERY_N_STEPS == 0:
+        avg_loss = sum(loss_log) / len(loss_log)
+        print(f"Step [{step}], Loss: {avg_loss:.4f}")
+        loss_log = []
+
+    # 验证
+    if step % VALIDATE_EVERY_N_STEPS == 0:
+        with torch.no_grad():
+            valid_loss_log = []
+            for batch in tqdm(test_loader):
+                prompt_chosen_batch = batch['prompt_chosen_ids'].to(DEVICE)
+                prompt_chosen_batch_attention_mask = batch['prompt_chosen_attention_mask'].to(DEVICE)
+                prompt_rejected_batch = batch['prompt_rejected_ids'].to(DEVICE)
+                prompt_rejected_batch_attention_mask = batch['prompt_rejected_attention_mask'].to(DEVICE)
+                prompt_offset_lens_batch = batch['prompt_offset_lens'].to(DEVICE)
+
+                outputs_chosen = model(prompt_chosen_batch)
+                outputs_rejceted = model(prompt_rejected_batch)
+                chosen_seq_logprob = get_sequence_logprobs(prompt_chosen_batch, outputs_chosen.logits, prompt_chosen_batch_attention_mask, prompt_offset_lens_batch)
+                rejected_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, outputs_rejceted.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
+
+                outputs_chosen_ref = ref_model(prompt_chosen_batch)
+                outputs_rejceted_ref = ref_model(prompt_rejected_batch)
+                chosen_ref_seq_logprob = get_sequence_logprobs(prompt_chosen_batch, outputs_chosen_ref.logits, prompt_chosen_batch_attention_mask, prompt_offset_lens_batch)
+                rejected_ref_seq_logprob = get_sequence_logprobs(prompt_rejected_batch, outputs_rejceted_ref.logits, prompt_rejected_batch_attention_mask, prompt_offset_lens_batch)
+
+                log_ratio_chosen = chosen_seq_logprob - chosen_ref_seq_logprob
+                log_ratio_rejected = rejected_seq_logprob - rejected_ref_seq_logprob
+                loss = -torch.F.logsigmoid((log_ratio_chosen - log_ratio_rejected)*BETA).mean()
+
+                valid_loss_log.append(loss.item())
+            avg_loss = sum(valid_loss_log) / len(valid_loss_log)
+            print(f"Step [{step}], Valid Loss: {avg_loss:.4f}")
