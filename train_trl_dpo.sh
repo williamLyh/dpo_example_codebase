@@ -1,1 +1,14 @@
-accelerate launch train_dpo.py
+accelerate launch trl_dpo.py \
+    --dataset_name trl-lib/ultrafeedback_binarized \
+    --dataset_streaming \
+    --model_name_or_path Qwen/Qwen2-0.5B-Instruct \
+    --learning_rate 5.0e-7 \
+    --num_train_epochs 1 \
+    --per_device_train_batch_size 2 \
+    --gradient_accumulation_steps 8 \
+    --gradient_checkpointing \
+    --eval_strategy steps \
+    --eval_steps 50 \
+    --output_dir Qwen2-0.5B-DPO \
+    --no_remove_unused_columns
+    --report_to wandb
